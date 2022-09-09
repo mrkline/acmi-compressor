@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{self, prelude::*, BufReader, BufWriter},
     mem::{discriminant, Discriminant},
+    sync::mpsc::{sync_channel, Receiver},
 };
 
 use anyhow::{bail, Context, Result};
@@ -119,18 +120,47 @@ fn run() -> Result<()> {
     };
     debug!("New reference lat/lon: {new_reference_ll:?}");
 
+    let original_size = fh.stream_position()?;
+    fh.rewind()?;
+
+    let (tx, rx) = sync_channel(0);
+
+    std::thread::scope(|s| {
+        let write_thread =
+            s.spawn(move || writer_thread(rx, &reference_ll, &new_reference_ll, original_size));
+
+        let read_thread = s.spawn(move || {
+            let reader = Reader::new(&args.acmi, &mut fh)?;
+            for rec in reader {
+                if tx.send(rec?).is_err() {
+                    break;
+                }
+            }
+            anyhow::Ok(())
+        });
+
+        write_thread.join().expect("Couldn't join writer thread")?;
+        read_thread.join().expect("Couldn't join reader thread")?;
+        anyhow::Ok(())
+    })?;
+
+    Ok(())
+}
+
+fn writer_thread(
+    record_rx: Receiver<Record>,
+    reference_ll: &LL,
+    new_reference_ll: &LL,
+    original_size: u64,
+) -> Result<()> {
+    let mut w = tacview::Writer::new(CountingWriter::new(BufWriter::new(io::stdout().lock())))?;
+
     let mut this_frame = 0f64;
     let mut active_entities: FxHashMap<u64, PropertyMap> = FxHashMap::default();
 
-    let original_size = fh.stream_position()?;
-    fh.rewind()?;
-    let reader = Reader::new(&args.acmi, &mut fh)?;
-
-    let mut w = tacview::Writer::new(CountingWriter::new(BufWriter::new(io::stdout().lock())))?;
-
     info!("Rewriting all records");
-    for rec in reader {
-        match rec? {
+    while let Ok(rec) = record_rx.recv() {
+        match rec {
             // Pass global properties through, except lat/lon.
             // Change those to the new one!
             Record::GlobalProperty(gp) => match gp {
