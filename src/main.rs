@@ -1,9 +1,11 @@
 use std::{
     fs::File,
     io::{self, prelude::*, BufReader, BufWriter},
+    mem::{discriminant, Discriminant},
 };
 
 use anyhow::{bail, Context, Result};
+use bytesize::ByteSize;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use float_ord::FloatOrd;
@@ -34,6 +36,7 @@ enum Color {
     Never,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Reader<'a> {
     Uncompressed(tacview::Parser<BufReader<&'a mut File>>),
     Compressed(tacview::Parser<zip::read::ZipFile<'a>>),
@@ -62,11 +65,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, written: 0 }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Default)]
 struct LL {
     lat: f64,
     lon: f64,
 }
+
+type PropertyMap = FxHashMap<Discriminant<Property>, Property>;
 
 fn run() -> Result<()> {
     let args = Args::parse();
@@ -80,24 +108,7 @@ fn run() -> Result<()> {
 
     let mut reader = Reader::new(&args.acmi, &mut fh)?;
 
-    let mut reference_ll: LL = LL::default();
-
-    for global in &mut reader {
-        let global = match global? {
-            Record::GlobalProperty(gp) => gp,
-            _ => break,
-        };
-
-        match global {
-            GlobalProperty::ReferenceLatitude(lat) => {
-                reference_ll.lat = lat;
-            }
-            GlobalProperty::ReferenceLongitude(lon) => {
-                reference_ll.lon = lon;
-            }
-            _not_ll => {}
-        }
-    }
+    let reference_ll = parse_original_ll(&mut reader)?;
     debug!("Original reference lat/lon: {reference_ll:?}");
 
     let min_ll = find_min_ll(reader)?;
@@ -108,14 +119,16 @@ fn run() -> Result<()> {
     };
     debug!("New reference lat/lon: {new_reference_ll:?}");
 
-    let mut last_frame = 0f64;
-    let mut active_entities: FxHashMap<u64, Vec<Property>> = FxHashMap::default();
+    let mut this_frame = 0f64;
+    let mut active_entities: FxHashMap<u64, PropertyMap> = FxHashMap::default();
 
+    let original_size = fh.stream_position()?;
     fh.rewind()?;
     let reader = Reader::new(&args.acmi, &mut fh)?;
 
-    let mut w = tacview::Writer::new(BufWriter::new(io::stdout().lock()))?;
+    let mut w = tacview::Writer::new(CountingWriter::new(BufWriter::new(io::stdout().lock())))?;
 
+    info!("Rewriting all records");
     for rec in reader {
         match rec? {
             // Pass global properties through, except lat/lon.
@@ -135,36 +148,82 @@ fn run() -> Result<()> {
 
             // Pass frame timestamps through only when they're new.
             Record::Frame(ts) => {
-                if ts != last_frame {
+                if ts != this_frame {
                     w.write(Record::Frame(ts))?;
-                    last_frame = ts;
+                    this_frame = ts;
+                } else {
+                    trace!("Skipping redundant frame time {ts:.2}");
                 }
             }
 
             Record::Update(mut up) => {
+                let mut props = props_map(up.props);
+
                 // Fix up coords.
-                for prop in &mut up.props {
+                if let Some(prop) = props.get_mut(&discriminant(&Property::T(Coords::default()))) {
                     match prop {
                         Property::T(c) => {
                             offset_coords(c, &reference_ll, &new_reference_ll);
                         }
-                        _ => {}
+                        _ => unreachable!(),
                     }
                 }
 
                 use std::collections::hash_map::Entry;
 
-                // Horrid:
                 match active_entities.entry(up.id) {
                     Entry::Vacant(v) => {
-                        v.insert(up.props.clone());
+                        // Back into a list you go
+                        // (change tacview-rs to store maps?)
+                        up.props = props.values().cloned().collect();
                         w.write(up)?;
-                    },
+
+                        v.insert(props);
+                    }
                     Entry::Occupied(mut o) => {
-                        if up.props != *o.get() {
-                            // TODO: Only write fields that changed!
-                            *o.get_mut() = up.props.clone();
-                            w.write(up)?;
+                        let mut changed_props = PropertyMap::default();
+
+                        // For each property in the new update,
+                        for (prop_type, prop) in props {
+                            // If we were already tracking that property and it changed,
+                            // note that.
+                            if let Some(prev) = o.get().get(&prop_type) {
+                                // Coords are a speical case:
+                                // Like properties, individiual entries in them
+                                // can be left blank if they haven't changed.
+                                if let Property::T(prev_coord) = prev {
+                                    let curr_coord = match prop {
+                                        Property::T(c) => c,
+                                        _ => unreachable!(),
+                                    };
+
+                                    let delta = prev_coord.delta(&curr_coord);
+
+                                    // If any fields changed, _then_ we care.
+                                    if delta != Coords::default() {
+                                        changed_props.insert(prop_type, Property::T(delta));
+                                    }
+                                } else if *prev != prop {
+                                    changed_props.insert(prop_type, prop);
+                                }
+                            }
+                            // And if we weren't tracking that property yet, note that.
+                            else {
+                                changed_props.insert(prop_type, prop);
+                            }
+                        }
+
+                        if !changed_props.is_empty() {
+                            // We only need to record properties that changed:
+                            w.write(Update {
+                                id: up.id,
+                                props: changed_props.values().cloned().collect(),
+                            })?;
+
+                            // And merge them back into our record
+                            o.get_mut().extend(changed_props);
+                        } else {
+                            // trace!("No properties changed for {:x} at {}", up.id, this_frame);
                         }
                     }
                 }
@@ -174,10 +233,23 @@ fn run() -> Result<()> {
             Record::Remove(id) => {
                 if active_entities.remove(&id).is_some() {
                     w.write(Record::Remove(id))?;
+                } else {
+                    trace!("Skipping redundant remove for {id:x}");
                 }
             }
         };
     }
+
+    let mut w = w.into_inner();
+    w.flush()?;
+    let compressed_size = w.written;
+
+    info!(
+        "Compressed {} ACMI to {} ({}%)",
+        ByteSize::b(original_size),
+        ByteSize::b(compressed_size),
+        compressed_size as f64 / original_size as f64 * 100.0
+    );
 
     Ok(())
 }
@@ -195,34 +267,60 @@ fn offset_coords(c: &mut Coords, old_ref: &LL, new_ref: &LL) {
     }
 }
 
+fn props_map(props: Vec<Property>) -> PropertyMap {
+    props.into_iter().map(|p| (discriminant(&p), p)).collect()
+}
+
+fn parse_original_ll(reader: &mut Reader) -> Result<LL> {
+    let mut reference_ll: LL = LL::default();
+
+    for global in reader {
+        let global = match global? {
+            Record::GlobalProperty(gp) => gp,
+            _ => break,
+        };
+
+        match global {
+            GlobalProperty::ReferenceLatitude(lat) => {
+                reference_ll.lat = lat;
+            }
+            GlobalProperty::ReferenceLongitude(lon) => {
+                reference_ll.lon = lon;
+            }
+            _not_ll => {}
+        }
+    }
+
+    Ok(reference_ll)
+}
+
 fn find_min_ll(records: Reader) -> Result<LL> {
+    info!("Reading all records to find the minimum lat/lon");
+
     let mut new_ref_lat = None;
     let mut new_ref_lon = None;
 
     for rec in records {
-        match rec? {
-            Record::Update(Update { props, .. }) => {
-                if let Some(coords) = props.iter().find(|p| matches!(p, Property::T(_))) {
-                    let coords = match coords {
-                        Property::T(t) => t,
-                        _ => unreachable!(),
-                    };
+        if let Record::Update(Update { props, .. }) = rec? {
+            if let Some(coords) = props.iter().find(|p| matches!(p, Property::T(_))) {
+                let coords = match coords {
+                    Property::T(t) => t,
+                    _ => unreachable!(),
+                };
 
-                    if let Some(lat) = coords.latitude {
-                        new_ref_lat = Some(match new_ref_lat {
-                            None => lat,
-                            Some(prev) => std::cmp::min(FloatOrd(prev), FloatOrd(lat)).0,
-                        });
-                    }
-                    if let Some(lon) = coords.longitude {
-                        new_ref_lon = Some(match new_ref_lon {
-                            None => lon,
-                            Some(prev) => std::cmp::min(FloatOrd(prev), FloatOrd(lon)).0,
-                        });
-                    }
+                if let Some(lat) = coords.latitude {
+                    new_ref_lat = Some(match new_ref_lat {
+                        None => lat,
+                        Some(prev) => std::cmp::min(FloatOrd(prev), FloatOrd(lat)).0,
+                    });
+                }
+                if let Some(lon) = coords.longitude {
+                    new_ref_lon = Some(match new_ref_lon {
+                        None => lon,
+                        Some(prev) => std::cmp::min(FloatOrd(prev), FloatOrd(lon)).0,
+                    });
                 }
             }
-            _ => {}
         }
     }
 
