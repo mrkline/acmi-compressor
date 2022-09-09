@@ -2,13 +2,13 @@ use std::{
     fs::File,
     io::{self, prelude::*, BufReader, BufWriter},
     mem::{discriminant, Discriminant},
-    sync::mpsc::{sync_channel, Receiver},
 };
 
 use anyhow::{bail, Context, Result};
 use bytesize::ByteSize;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
+use crossbeam::channel::{bounded, Receiver};
 use float_ord::FloatOrd;
 use log::*;
 use rustc_hash::FxHashMap;
@@ -123,7 +123,7 @@ fn run() -> Result<()> {
     let original_size = fh.stream_position()?;
     fh.rewind()?;
 
-    let (tx, rx) = sync_channel(0);
+    let (tx, rx) = bounded(1024);
 
     std::thread::scope(|s| {
         let write_thread =
@@ -158,6 +158,10 @@ fn writer_thread(
     let mut this_frame = 0f64;
     let mut active_entities: FxHashMap<u64, PropertyMap> = FxHashMap::default();
 
+    // Dumb experiment
+    let mut total_coords = 0u64;
+    let mut total_props = 0u64;
+
     info!("Rewriting all records");
     while let Ok(rec) = record_rx.recv() {
         match rec {
@@ -187,17 +191,16 @@ fn writer_thread(
             }
 
             Record::Update(mut up) => {
-                let mut props = props_map(up.props);
-
                 // Fix up coords.
-                if let Some(prop) = props.get_mut(&discriminant(&Property::T(Coords::default()))) {
-                    match prop {
-                        Property::T(c) => {
-                            offset_coords(c, &reference_ll, &new_reference_ll);
-                        }
-                        _ => unreachable!(),
+                for prop in &mut up.props {
+                    if let Property::T(c) = prop {
+                        offset_coords(c, &reference_ll, &new_reference_ll);
+                        total_coords += 1;
                     }
+                    total_props += 1;
                 }
+
+                let props = props_map(up.props);
 
                 use std::collections::hash_map::Entry;
 
@@ -275,10 +278,16 @@ fn writer_thread(
     let compressed_size = w.written;
 
     info!(
-        "Compressed {} ACMI to {} ({}%)",
+        "Compressed {} ACMI to {} ({:.1}%)",
         ByteSize::b(original_size),
         ByteSize::b(compressed_size),
         compressed_size as f64 / original_size as f64 * 100.0
+    );
+    debug!(
+        "{}/{} coords ({:.1}%)",
+        total_coords,
+        total_props,
+        total_coords as f64 / total_props as f64 * 100.0
     );
 
     Ok(())
@@ -298,7 +307,9 @@ fn offset_coords(c: &mut Coords, old_ref: &LL, new_ref: &LL) {
 }
 
 fn props_map(props: Vec<Property>) -> PropertyMap {
-    props.into_iter().map(|p| (discriminant(&p), p)).collect()
+    let mut map = PropertyMap::with_capacity_and_hasher(props.len(), Default::default());
+    map.extend(props.into_iter().map(|p| (discriminant(&p), p)));
+    map
 }
 
 fn parse_original_ll(reader: &mut Reader) -> Result<LL> {

@@ -16,9 +16,10 @@ anyhow = { version = "1.0", features = ["backtrace"] }
 bytesize = "1.1"
 camino = "1.0"
 clap = { version = "3.0", features = ["derive"] }
+crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
 float-ord = "0.3"
 log = "0.4"
 rustc-hash = "1.1"
 simplelog = "0.12"
-tacview = { git = "https://github.com/mrkline/tacview", rev = "314f3ad591aaaa92f703799b90a93b526a86f91d" }
+tacview = { git = "https://github.com/mrkline/tacview", rev = "4569ca5b8cf0d3008d3aa20a4aa9156e05c93799" }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
