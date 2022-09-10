@@ -323,29 +323,50 @@ fn find_min_ll(records: Reader) -> Result<LL> {
     let mut new_ref_lat = None;
     let mut new_ref_lon = None;
 
-    for rec in records {
-        if let Record::Update(Update { props, .. }) = rec? {
-            if let Some(coords) = props.get(&discriminant(&Property::T(Coords::default()))) {
-                let coords = match coords {
-                    Property::T(t) => t,
-                    _ => unreachable!(),
-                };
+    let (tx, rx) = bounded(1024);
 
-                if let Some(lat) = coords.latitude {
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            while let Ok((new_lat, new_lon)) = rx.recv() {
+                if let Some(lat) = new_lat {
                     new_ref_lat = Some(match new_ref_lat {
                         None => lat,
                         Some(prev) => std::cmp::min(FloatOrd(prev), FloatOrd(lat)).0,
                     });
                 }
-                if let Some(lon) = coords.longitude {
+                if let Some(lon) = new_lon {
                     new_ref_lon = Some(match new_ref_lon {
                         None => lon,
                         Some(prev) => std::cmp::min(FloatOrd(prev), FloatOrd(lon)).0,
                     });
                 }
             }
+        });
+
+        for rec in records.filter_map(|rec| {
+            if let Record::Update(Update { props, .. }) = rec.expect("Error reading record") {
+                if let Some(coords) = props.get(&discriminant(&Property::T(Coords::default()))) {
+                    let coords = match coords {
+                        Property::T(t) => t,
+                        _ => unreachable!(),
+                    };
+
+                    if coords.latitude.is_some() || coords.longitude.is_some() {
+                        Some((coords.latitude, coords.longitude))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }) {
+            tx.send(rec).unwrap();
         }
-    }
+        drop(tx);
+    });
 
     Ok(LL {
         lat: new_ref_lat.unwrap_or(0f64),
