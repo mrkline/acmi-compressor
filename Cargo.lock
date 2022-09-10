@@ -454,9 +454,10 @@ dependencies = [
 [[package]]
 name = "tacview"
 version = "0.2.0"
-source = "git+https://github.com/mrkline/tacview?rev=4569ca5b8cf0d3008d3aa20a4aa9156e05c93799#4569ca5b8cf0d3008d3aa20a4aa9156e05c93799"
+source = "git+https://github.com/mrkline/tacview?rev=6e3da78c144e34b81bb57b489ba04676e7f16752#6e3da78c144e34b81bb57b489ba04676e7f16752"
 dependencies = [
  "arrayvec",
+ "rustc-hash",
  "thiserror",
  "zip",
 ]

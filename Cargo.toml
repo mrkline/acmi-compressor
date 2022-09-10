@@ -21,5 +21,5 @@ float-ord = "0.3"
 log = "0.4"
 rustc-hash = "1.1"
 simplelog = "0.12"
-tacview = { git = "https://github.com/mrkline/tacview", rev = "4569ca5b8cf0d3008d3aa20a4aa9156e05c93799" }
+tacview = { git = "https://github.com/mrkline/tacview", rev = "6e3da78c144e34b81bb57b489ba04676e7f16752" }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
