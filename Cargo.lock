@@ -487,7 +487,7 @@ dependencies = [
 [[package]]
 name = "tacview"
 version = "0.2.0"
-source = "git+https://github.com/mrkline/tacview?rev=aaa97cd27be2e93e0ff23b75dff4fca8e2aa8fdb#aaa97cd27be2e93e0ff23b75dff4fca8e2aa8fdb"
+source = "git+https://github.com/mrkline/tacview?rev=3cd01d613eba03af940a1f76341919ea6823dbc1#3cd01d613eba03af940a1f76341919ea6823dbc1"
 dependencies = [
  "arrayvec",
  "serde",
