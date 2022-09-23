@@ -1,19 +1,15 @@
 use std::{
     fs::File,
-    io::{self, prelude::*, BufReader, BufWriter},
+    io::{prelude::*, BufReader, BufWriter},
 };
 
 use anyhow::{bail, Context, Result};
-use bytesize::ByteSize;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use crossbeam::channel::{bounded, Receiver};
 use log::*;
 use simplelog::*;
-use tacview::{
-    record::Record,
-    ParseError,
-};
+use tacview::{record::Record, ParseError};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -63,29 +59,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-struct CountingWriter<W> {
-    inner: W,
-    written: u64,
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        self.written += written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl<W: Write> CountingWriter<W> {
-    fn new(inner: W) -> Self {
-        Self { inner, written: 0 }
-    }
-}
-
 fn run() -> Result<()> {
     let args = Args::parse();
     init_logger(&args);
@@ -96,17 +69,10 @@ fn run() -> Result<()> {
 
     let mut fh = File::open(&args.acmi).context("Couldn't open ACMI")?;
 
-    let original_size = || -> Result<u64> {
-        let len = fh.seek(std::io::SeekFrom::End(0))?;
-        fh.seek(std::io::SeekFrom::Start(0))?;
-        Ok(len)
-    }()?;
-
     let (tx, rx) = bounded(1024);
 
     std::thread::scope(|s| {
-        let write_thread =
-            s.spawn(move || writer_thread(rx, original_size));
+        let write_thread = s.spawn(move || writer_thread(rx));
 
         let read_thread = s.spawn(move || {
             let reader = Reader::new(&args.acmi, &mut fh)?;
@@ -126,28 +92,24 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn writer_thread(
-    record_rx: Receiver<Record>,
-    original_size: u64,
-) -> Result<()> {
+fn writer_thread(record_rx: Receiver<Record>) -> Result<()> {
     use ciborium::ser::into_writer as cborize;
 
-    let mut w = CountingWriter::new(BufWriter::new(io::stdout().lock()));
+    let mut num_record = 0u64;
 
-    info!("Rewriting all records");
     while let Ok(rec) = record_rx.recv() {
-        cborize(&rec, &mut w)?
+        let mut w = BufWriter::new(std::fs::File::create(format!(
+            "cbor_fun/{num_record:05}.cbor"
+        ))?);
+        cborize(&rec, &mut w)?;
+        w.flush()?;
+        num_record += 1;
+        if num_record >= 10000 {
+            break;
+        }
     }
+    info!("{num_record:05} records processed");
 
-    w.flush()?;
-    let compressed_size = w.written;
-
-    info!(
-        "Compressed {} ACMI to {} ({:.1}%)",
-        ByteSize::b(original_size),
-        ByteSize::b(compressed_size),
-        compressed_size as f64 / original_size as f64 * 100.0
-    );
     Ok(())
 }
 
