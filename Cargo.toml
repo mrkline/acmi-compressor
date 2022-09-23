@@ -20,5 +20,5 @@ clap = { version = "3.0", features = ["derive"] }
 crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
 log = "0.4"
 simplelog = "0.12"
-tacview = { git = "https://github.com/mrkline/tacview", rev = "3cd01d613eba03af940a1f76341919ea6823dbc1" }
+tacview = { git = "https://github.com/mrkline/tacview", rev = "b057ba2c2755a957b383667c5a25b574f93c4802" }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
