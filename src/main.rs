@@ -158,6 +158,10 @@ fn writer_thread(
     let mut this_frame = 0f64;
     let mut active_entities: FxHashMap<u64, PropertyMap> = FxHashMap::default();
 
+    // Dumb experiment
+    let mut total_coords = 0u64;
+    let mut total_props = 0u64;
+
     info!("Rewriting all records");
     while let Ok(rec) = record_rx.recv() {
         match rec {
@@ -188,30 +192,32 @@ fn writer_thread(
 
             Record::Update(mut up) => {
                 // Fix up coords.
-                if let Some(c) = up
-                    .props
-                    .get_mut(&discriminant(&Property::T(Coords::default())))
-                {
-                    let c = match c {
-                        Property::T(c) => c,
-                        _ => unreachable!(),
-                    };
-
-                    offset_coords(c, reference_ll, new_reference_ll);
+                for prop in &mut up.props {
+                    if let Property::T(c) = prop {
+                        offset_coords(c, &reference_ll, &new_reference_ll);
+                        total_coords += 1;
+                    }
+                    total_props += 1;
                 }
+
+                let props = props_map(up.props);
 
                 use std::collections::hash_map::Entry;
 
                 match active_entities.entry(up.id) {
                     Entry::Vacant(v) => {
-                        w.write(up.clone())?;
-                        v.insert(up.props);
+                        // Back into a list you go
+                        // (change tacview-rs to store maps?)
+                        up.props = props.values().cloned().collect();
+                        w.write(up)?;
+
+                        v.insert(props);
                     }
                     Entry::Occupied(mut o) => {
                         let mut changed_props = PropertyMap::default();
 
                         // For each property in the new update,
-                        for (prop_type, prop) in up.props {
+                        for (prop_type, prop) in props {
                             // If we were already tracking that property and it changed,
                             // note that.
                             if let Some(prev) = o.get().get(&prop_type) {
@@ -244,7 +250,7 @@ fn writer_thread(
                             // We only need to record properties that changed:
                             w.write(Update {
                                 id: up.id,
-                                props: changed_props.clone(),
+                                props: changed_props.values().cloned().collect(),
                             })?;
 
                             // And merge them back into our record
@@ -277,6 +283,12 @@ fn writer_thread(
         ByteSize::b(compressed_size),
         compressed_size as f64 / original_size as f64 * 100.0
     );
+    debug!(
+        "{}/{} coords ({:.1}%)",
+        total_coords,
+        total_props,
+        total_coords as f64 / total_props as f64 * 100.0
+    );
 
     Ok(())
 }
@@ -292,6 +304,12 @@ fn offset_coords(c: &mut Coords, old_ref: &LL, new_ref: &LL) {
         *lon -= new_ref.lon;
         assert!(*lon > 0.0);
     }
+}
+
+fn props_map(props: Vec<Property>) -> PropertyMap {
+    let mut map = PropertyMap::with_capacity_and_hasher(props.len(), Default::default());
+    map.extend(props.into_iter().map(|p| (discriminant(&p), p)));
+    map
 }
 
 fn parse_original_ll(reader: &mut Reader) -> Result<LL> {
@@ -325,7 +343,7 @@ fn find_min_ll(records: Reader) -> Result<LL> {
 
     for rec in records {
         if let Record::Update(Update { props, .. }) = rec? {
-            if let Some(coords) = props.get(&discriminant(&Property::T(Coords::default()))) {
+            if let Some(coords) = props.iter().find(|p| matches!(p, Property::T(_))) {
                 let coords = match coords {
                     Property::T(t) => t,
                     _ => unreachable!(),
